@@ -1,485 +1,859 @@
-import React, { useState, useEffect } from 'react';
-import { Viewport3D, CameraViewMode } from './components/Viewport3D';
-import { BottomControlDock } from './components/BottomControlDock';
+import React, { useCallback, useRef, useState } from 'react';
 import {
   BodyPose,
-  DetectedObject,
-  EnvironmentType,
-  GaitType,
-  LcdDisplayState,
-  LogEntry,
-  MicrophoneState,
-  RobotActivityState,
-  RobotJointAngles,
-  SceneItem,
-  SensorData,
-  Vector3D,
-} from './types/robot';
-import { DEFAULT_BODY_POSE } from './simulation/kinematics';
+  CameraModuleConfig,
+  CameraViewMode,
+  GaitConfig,
+  LabSceneObject,
+  LcdModuleConfig,
+  LegId,
+  LegTestState,
+  LightingPreset,
+  MicModuleConfig,
+  NavigationConfigAndState,
+  PosePreset,
+  ScenarioId,
+  SelectableTarget,
+  SensorTelemetry,
+  ServoChannel,
+  SimulatedDetection,
+} from './types/simulator';
 import {
-  Radio,
-  Compass,
-  BatteryCharging,
-  ShieldCheck,
-  Cpu,
-  Octagon,
-  Scan,
-  Monitor,
-  Mic,
-  RotateCcw,
-} from 'lucide-react';
+  INITIAL_BODY_POSE,
+  INITIAL_CAMERA_MODULE,
+  INITIAL_GAIT_CONFIG,
+  INITIAL_LAB_OBJECTS,
+  INITIAL_LCD_MODULE,
+  INITIAL_LEG_TEST,
+  INITIAL_MIC_MODULE,
+  INITIAL_NAVIGATION_STATE,
+  INITIAL_SERVO_CHANNELS,
+  INITIAL_TELEMETRY,
+  LEG_CHANNELS_MAP,
+  SCENARIO_PRESETS,
+} from './simulation/initialState';
+import {
+  clampChannelAngle,
+  computeCoordinatedLegTargets,
+  getPosePresetTargets,
+  resolveSolidBodyMovement,
+} from './simulation/kinematics';
+import { checkRobotPoseCollision } from './simulation/collision';
+import { Viewport3D } from './components/Viewport3D';
+import { RobotControlPanel } from './components/RobotControlPanel';
+import { JointControlPanel } from './components/JointControlPanel';
+import { ModulesVisionPanel } from './components/ModulesVisionPanel';
+import { SceneLabPanel } from './components/SceneLabPanel';
+import { TelemetryPanel } from './components/TelemetryPanel';
+import { OctagonX, PanelRightClose, PanelRightOpen } from 'lucide-react';
+
+type DashboardTab = 'control' | 'joints' | 'modules' | 'scene' | 'telemetry';
+
+function cloneSceneObjects(objs: LabSceneObject[]): LabSceneObject[] {
+  return objs.map((o) => ({
+    ...o,
+    position: [...o.position] as [number, number, number],
+    rotation: [...o.rotation] as [number, number, number],
+    scale: [...o.scale] as [number, number, number],
+  }));
+}
 
 export default function App() {
-  // Start stationary as requested: stationary default pose
-  const [gait, setGait] = useState<GaitType>('stand');
-  const [isSimRunning, setIsSimRunning] = useState<boolean>(false); // Start stationary!
-  const [isEmergencyStopped, setIsEmergencyStopped] = useState<boolean>(false);
-  const [robotState, setRobotState] = useState<RobotActivityState>('IDLE');
+  const [activeTab, setActiveTab] = useState<DashboardTab>('control');
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(true);
 
-  const [envType, setEnvType] = useState<EnvironmentType>('lab');
-  const [bodyPose, setBodyPose] = useState<BodyPose>(DEFAULT_BODY_POSE);
-  const [strideLength, setStrideLength] = useState<number>(35);
-  const [stepHeight, setStepHeight] = useState<number>(25);
-  const [turnRate, setTurnRate] = useState<number>(0);
-  const [speedMultiplier, setSpeedMultiplier] = useState<number>(1);
-  const [cameraMode, setCameraMode] = useState<CameraViewMode>('orbit');
-  const [isFovVisible, setIsFovVisible] = useState<boolean>(true);
+  const [channels, setChannels] = useState<ServoChannel[]>(INITIAL_SERVO_CHANNELS);
+  const [extendedSimBoundsUnlocked, setExtendedSimBoundsUnlocked] = useState<boolean>(false);
+  const [visualKinematicGain, setVisualKinematicGain] = useState<number>(1);
 
-  // Initial selected joint is CH7 (Back-left hip-pitch joint) as specifically required!
-  const [selectedChannel, setSelectedChannel] = useState<number>(7);
-  const [selectedPartName, setSelectedPartName] = useState<string>('BL Hip Pitch (CH7)');
+  const [bodyPose, setBodyPose] = useState<BodyPose>(INITIAL_BODY_POSE);
+  const [manualPoseToken, setManualPoseToken] = useState<number>(0);
+  const [posePreset, setPosePreset] = useState<PosePreset>('stand');
+  const [gait, setGait] = useState<GaitConfig>(INITIAL_GAIT_CONFIG);
+  const [legTest, setLegTest] = useState<LegTestState>(INITIAL_LEG_TEST);
 
-  // Sim time tracking
-  const [simTimeSeconds, setSimTimeSeconds] = useState<number>(0);
+  const [navigation, setNavigation] = useState<NavigationConfigAndState>(
+    INITIAL_NAVIGATION_STATE
+  );
+  const [activeScenario, setActiveScenario] = useState<ScenarioId>('default-lab');
+  const [scenarioResetToken, setScenarioResetToken] = useState<number>(0);
 
-  // 12-DOF joint targets (CH7 starts at initial target 95° within 90°-100° software limits)
-  const [joints, setJoints] = useState<RobotJointAngles>({
-    FL: { hip: 0, shoulder: 45, knee: -90 },
-    FR: { hip: 0, shoulder: 45, knee: -90 },
-    RL: { hip: 0, shoulder: 95, knee: -90 }, // CH7 Back-Left Hip Pitch initial target: 95°
-    RR: { hip: 0, shoulder: 45, knee: -90 },
-  });
+  const [cameraModule, setCameraModule] = useState<CameraModuleConfig>(INITIAL_CAMERA_MODULE);
+  const [lcdModule, setLcdModule] = useState<LcdModuleConfig>(INITIAL_LCD_MODULE);
+  const [micModule, setMicModule] = useState<MicModuleConfig>(INITIAL_MIC_MODULE);
 
-  // Live sensors telemetry state
-  const [sensors, setSensors] = useState<SensorData>({
-    ultrasonicDistanceCm: 142.5,
-    imu: {
-      roll: 0.0,
-      pitch: 0.0,
-      yaw: 0.0,
-      accel: { x: 0.0, y: 9.81, z: 0.0 },
-      gyro: { x: 0.0, y: 0.0, z: 0.0 },
-      tempC: 38.4,
+  const [labObjects, setLabObjects] = useState<LabSceneObject[]>(() =>
+    cloneSceneObjects(INITIAL_LAB_OBJECTS)
+  );
+  const [collidingIds, setCollidingIds] = useState<string[]>([]);
+  const [detections, setDetections] = useState<SimulatedDetection[]>([]);
+  const [telemetry, setTelemetry] = useState<SensorTelemetry>(INITIAL_TELEMETRY);
+
+  const [selectedTarget, setSelectedTarget] = useState<SelectableTarget>(null);
+  const [attachmentMode, setAttachmentMode] = useState<boolean>(false);
+  const [cameraViewMode, setCameraViewMode] = useState<CameraViewMode>('orbit');
+
+  const [lightingPreset, setLightingPreset] = useState<LightingPreset>('studio');
+  const [lightIntensity, setLightIntensity] = useState<number>(1.0);
+  const [shadowsEnabled, setShadowsEnabled] = useState<boolean>(true);
+
+  const robotFeedCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const spawnCounterRef = useRef<number>(2);
+
+  // Stop all active animations & autonomous navigation immediately (never auto-restarts until user starts again)
+  const handleStopSimulation = useCallback(() => {
+    setGait((prev) => ({ ...prev, isRunning: false }));
+    setLegTest((prev) => ({ ...prev, running: false, activeLeg: null }));
+    setNavigation((prev) => ({
+      ...prev,
+      enabled: false,
+      fsmState: 'IDLE',
+      activityState: 'IDLE',
+      selectedTurnDirection: 'NONE',
+      statusMessage: 'Stopped by user (IDLE)',
+      committedTurn: null,
+      targetYawDeg: null,
+      initialBypassHeadingDeg: null,
+      bypassObstacleId: null,
+      lastCommandedPose: null,
+    }));
+  }, []);
+
+  const handleStopGaitBeforeCollision = useCallback(() => {
+    setGait((prev) => (prev.isRunning ? { ...prev, isRunning: false } : prev));
+  }, []);
+
+  // Update body pose from user interaction (sliders, gizmo, floor-drag, lift/place) while enforcing solid obstacles
+  const handleUpdateBodyPose = useCallback(
+    (patch: Partial<BodyPose>) => {
+      setBodyPose((prev) => {
+        const requested: BodyPose = { ...prev, ...patch };
+        const res = resolveSolidBodyMovement(
+          prev,
+          requested,
+          channels,
+          labObjects,
+          visualKinematicGain
+        );
+        return res.resolvedPose;
+      });
+      setManualPoseToken((t) => t + 1);
     },
-    footContacts: { FL: true, FR: true, RL: true, RR: true },
-    footForces: { FL: 6.4, FR: 6.4, RL: 6.4, RR: 6.4 },
-    batteryVoltage: 7.85,
-    servoCurrentAmps: 1.15,
-  });
+    [channels, labObjects, visualKinematicGain]
+  );
 
-  // 16x2 LCD Display state
-  const [lcdState, setLcdState] = useState<LcdDisplayState>({
-    mode: 'status',
-    line1: 'KUKUR Quadruped',
-    line2: 'SYS: OK 50Hz SIM',
-    customLine1: 'HELLO KUKUR',
-    customLine2: 'SIMULATION READY',
-    backlight: true,
-    i2cAddress: '0x27',
-  });
+  // Sync body pose from autonomous navigation / gait controller without flagging external user manipulation
+  const handleUpdateBodyPoseFromSim = useCallback((nextSimPose: BodyPose) => {
+    setBodyPose(nextSimPose);
+  }, []);
 
-  // Microphone & Voice State
-  const [micState, setMicState] = useState<MicrophoneState>({
-    isListening: false,
-    isRealMic: false,
-    volume: 0,
-    waveform: [],
-    lastCommand: '',
-    commandHistory: [],
-  });
-
-  // Interactive 3D Scene Objects (Person, Box, Chair, Pylon, Barrel)
-  const [sceneItems, setSceneItems] = useState<SceneItem[]>([
-    {
-      id: 'person-1',
-      type: 'person',
-      name: 'Person (Mannequin)',
-      position: { x: 0.2, y: 0, z: 2.2 },
-      rotation: Math.PI,
-      isWalking: true,
-    },
-    {
-      id: 'box-1',
-      type: 'box',
-      name: 'Wooden Supply Crate',
-      position: { x: -1.2, y: 0, z: 1.4 },
-      rotation: 0.4,
-    },
-    {
-      id: 'chair-1',
-      type: 'chair',
-      name: 'Lab Office Chair',
-      position: { x: 1.3, y: 0, z: 1.8 },
-      rotation: -0.6,
-    },
-    {
-      id: 'pylon-1',
-      type: 'pylon',
-      name: 'Safety Pylon',
-      position: { x: -0.6, y: 0, z: 0.9 },
-      rotation: 0,
-    },
-    {
-      id: 'barrel-1',
-      type: 'barrel',
-      name: 'Storage Barrel',
-      position: { x: 0.8, y: 0, z: 3.2 },
-      rotation: 0,
-    },
-  ]);
-
-  // Detected Objects in front camera
-  const [detections, setDetections] = useState<DetectedObject[]>([]);
-
-  // Diagnostic Logs
-  const [logs, setLogs] = useState<LogEntry[]>([
-    {
-      id: '1',
-      timestamp: new Date().toLocaleTimeString(),
-      level: 'info',
-      source: 'KUKUR-CORE',
-      message: 'KUKUR Quadruped 3D Simulation initialized in SIMULATION ONLY mode.',
-    },
-    {
-      id: '2',
-      timestamp: new Date().toLocaleTimeString(),
-      level: 'info',
-      source: 'PCA9685',
-      message: 'PCA9685 12-channel mapping initialized. CH7 Back-Left Hip Pitch selected (90°-100°).',
-    },
-    {
-      id: '3',
-      timestamp: new Date().toLocaleTimeString(),
-      level: 'info',
-      source: 'LCD-0x27',
-      message: '16x2 Character LCD attached to front canopy with I2C address 0x27.',
-    },
-  ]);
-
-  const addLog = (level: LogEntry['level'], source: string, message: string) => {
-    setLogs((prev) => [
-      {
-        id: String(Date.now() + Math.random()),
-        timestamp: new Date().toLocaleTimeString(),
-        level,
-        source,
-        message,
-      },
-      ...prev.slice(0, 80),
-    ]);
-  };
-
-  // Simulation timer
-  useEffect(() => {
-    if (!isSimRunning || isEmergencyStopped) return;
-    const interval = setInterval(() => {
-      setSimTimeSeconds((prev) => prev + 0.1);
-    }, 100);
-    return () => clearInterval(interval);
-  }, [isSimRunning, isEmergencyStopped]);
-
-  // Handle sensor & telemetry updates from 3D Viewport
-  const handleSensorsUpdate = (newSensors: SensorData, newJoints: RobotJointAngles) => {
-    setSensors(newSensors);
-  };
-
-  // Handle click selection of joint or module from 3D Viewport
-  const handleSelectJointOrPart = (channel: number | null, name: string) => {
-    setSelectedPartName(name);
-    if (channel !== null) {
-      setSelectedChannel(channel);
-      addLog('cmd', 'INSPECTOR', `Selected joint CH${channel}: ${name}`);
-    } else {
-      addLog('info', 'INSPECTOR', `Selected module: ${name}`);
-    }
-  };
-
-  // Emergency Stop Handler
-  const handleEmergencyStop = () => {
-    setIsEmergencyStopped(true);
-    setIsSimRunning(false);
-    setRobotState('E_STOP');
-    addLog('error', 'SAFETY', 'EMERGENCY STOP engaged! All actuator commands halted.');
-  };
-
-  // Reset Simulation Handler
-  const handleResetSimulation = () => {
-    setIsEmergencyStopped(false);
-    setIsSimRunning(false);
-    setGait('stand');
-    setTurnRate(0);
-    setBodyPose(DEFAULT_BODY_POSE);
-    setJoints({
-      FL: { hip: 0, shoulder: 45, knee: -90 },
-      FR: { hip: 0, shoulder: 45, knee: -90 },
-      RL: { hip: 0, shoulder: 95, knee: -90 },
-      RR: { hip: 0, shoulder: 45, knee: -90 },
-    });
-    setRobotState('IDLE');
-    addLog('info', 'SAFETY', 'Simulation reset to stationary neutral pose. E-stop cleared.');
-  };
-
-  // Voice Command Dispatcher with safety verification
-  const handleExecuteVoiceCommand = (rawCmd: string): { success: boolean; message: string } => {
-    const cmd = rawCmd.toLowerCase().trim();
-
-    if (isEmergencyStopped) {
-      addLog('warn', 'VOICE', `Rejected command "${rawCmd}" — Emergency stop is active.`);
-      return { success: false, message: 'Command rejected: Emergency stop active.' };
-    }
-
-    if (cmd.includes('stand')) {
-      setGait('stand');
-      setIsSimRunning(false);
-      setRobotState('STANDING');
-      addLog('cmd', 'VOICE', `Executed voice command: "Stand"`);
-      return { success: true, message: 'KUKUR standing neutral.' };
-    }
-
-    if (cmd.includes('sit')) {
-      setGait('sit');
-      setIsSimRunning(false);
-      setRobotState('SITTING');
-      addLog('cmd', 'VOICE', `Executed voice command: "Sit"`);
-      return { success: true, message: 'KUKUR sitting down.' };
-    }
-
-    if (cmd.includes('walk') || cmd.includes('trot')) {
-      setGait(cmd.includes('walk') ? 'walk' : 'trot');
-      setIsSimRunning(true);
-      setRobotState('WALKING');
-      addLog('cmd', 'VOICE', `Executed voice command: "${rawCmd}"`);
-      return { success: true, message: 'KUKUR walking forward.' };
-    }
-
-    if (cmd.includes('stop')) {
-      setIsSimRunning(false);
-      setRobotState('IDLE');
-      addLog('cmd', 'VOICE', `Executed voice command: "Stop"`);
-      return { success: true, message: 'KUKUR stopped.' };
-    }
-
-    if (cmd.includes('left')) {
-      setTurnRate(-0.6);
-      setIsSimRunning(true);
-      addLog('cmd', 'VOICE', `Executed voice command: "Turn left"`);
-      return { success: true, message: 'Steering left.' };
-    }
-
-    if (cmd.includes('right')) {
-      setTurnRate(0.6);
-      setIsSimRunning(true);
-      addLog('cmd', 'VOICE', `Executed voice command: "Turn right"`);
-      return { success: true, message: 'Steering right.' };
-    }
-
-    if (cmd.includes('detect') || cmd.includes('object')) {
-      setLcdState((prev) => ({ ...prev, mode: 'detection' }));
-      addLog('cmd', 'VOICE', `Executed voice command: "Show detected objects"`);
-      return { success: true, message: 'Displaying detected objects on LCD.' };
-    }
-
-    if (cmd.includes('status')) {
-      setLcdState((prev) => ({ ...prev, mode: 'status' }));
-      addLog('cmd', 'VOICE', `Executed voice command: "Show robot status"`);
-      return { success: true, message: 'Displaying robot status on LCD.' };
-    }
-
-    addLog('warn', 'VOICE', `Unrecognized command: "${rawCmd}"`);
-    return { success: false, message: `Unrecognized command "${rawCmd}".` };
-  };
-
-  // Scene items modification handlers
-  const handleAddItem = (item: SceneItem) => {
-    setSceneItems((prev) => [...prev, item]);
-    addLog('info', 'WORLD', `Spawned ${item.name} at [${item.position.x}m, ${item.position.z}m]`);
-  };
-
-  const handleRemoveItem = (id: string) => {
-    setSceneItems((prev) => prev.filter((it) => it.id !== id));
-    addLog('info', 'WORLD', `Removed object ID ${id} from scene.`);
-  };
-
-  const handleUpdateItemPos = (id: string, pos: Vector3D) => {
-    setSceneItems((prev) =>
-      prev.map((it) => (it.id === id ? { ...it, position: pos } : it))
+  // Reset all joints to 95° and reset robot pose within current scene
+  const handleResetAll = useCallback(() => {
+    handleStopSimulation();
+    setPosePreset('neutral');
+    const scenarioDef = SCENARIO_PRESETS[activeScenario];
+    setBodyPose({ ...scenarioDef.robotPose });
+    setLegTest(INITIAL_LEG_TEST);
+    setChannels((prev) =>
+      prev.map((ch) => ({
+        ...ch,
+        targetAngle: clampChannelAngle(ch, 95),
+        currentSimulatedAngle: clampChannelAngle(ch, 95),
+      }))
     );
-  };
+    setScenarioResetToken((t) => t + 1);
+  }, [activeScenario, handleStopSimulation]);
+
+  // Apply a navigation test scenario (restoring both robot and obstacles to scenario initial positions)
+  const applyScenarioLayout = useCallback((scenarioId: ScenarioId) => {
+    const def = SCENARIO_PRESETS[scenarioId];
+    setActiveScenario(scenarioId);
+    setSelectedTarget(null);
+    setGait((prev) => ({ ...prev, isRunning: false }));
+    setLegTest(INITIAL_LEG_TEST);
+    setPosePreset('stand');
+    setBodyPose({ ...def.robotPose });
+    setLabObjects(cloneSceneObjects(def.objects));
+    setChannels((prev) =>
+      prev.map((ch) => ({
+        ...ch,
+        targetAngle: clampChannelAngle(ch, 95),
+        currentSimulatedAngle: clampChannelAngle(ch, 95),
+      }))
+    );
+    setNavigation((prev) => ({
+      ...INITIAL_NAVIGATION_STATE,
+      safetyDistanceM: prev.safetyDistanceM,
+      turnAngleDeg: prev.turnAngleDeg,
+      clearanceThresholdM: prev.clearanceThresholdM,
+      showSensorRays: prev.showSensorRays,
+      enabled: prev.enabled,
+      fsmState: prev.enabled ? 'IDLE' : 'IDLE',
+      activityState: prev.enabled ? 'WAITING' : 'IDLE',
+    }));
+    setScenarioResetToken((t) => t + 1);
+  }, []);
+
+  const handleResetScenario = useCallback(() => {
+    const def = SCENARIO_PRESETS[activeScenario];
+    setSelectedTarget(null);
+    setGait((prev) => ({ ...prev, isRunning: false }));
+    setLegTest(INITIAL_LEG_TEST);
+    setPosePreset('stand');
+    setBodyPose({ ...def.robotPose });
+    setLabObjects(cloneSceneObjects(def.objects));
+    setChannels((prev) =>
+      prev.map((ch) => ({
+        ...ch,
+        targetAngle: clampChannelAngle(ch, 95),
+        currentSimulatedAngle: clampChannelAngle(ch, 95),
+      }))
+    );
+    setNavigation((prev) => ({
+      ...INITIAL_NAVIGATION_STATE,
+      safetyDistanceM: prev.safetyDistanceM,
+      turnAngleDeg: prev.turnAngleDeg,
+      clearanceThresholdM: prev.clearanceThresholdM,
+      showSensorRays: prev.showSensorRays,
+      enabled: false,
+      fsmState: 'IDLE',
+      activityState: 'IDLE',
+    }));
+    setScenarioResetToken((t) => t + 1);
+  }, [activeScenario]);
+
+  const handleUpdateNavigation = useCallback((patch: Partial<NavigationConfigAndState>) => {
+    setNavigation((prev) => {
+      const next = { ...prev, ...patch };
+      if (patch.enabled === true && !prev.enabled) {
+        setGait((g) => ({ ...g, isRunning: false }));
+        setLegTest((lt) => ({ ...lt, running: false, activeLeg: null }));
+        if (next.fsmState === 'IDLE') {
+          next.fsmState = 'MOVING_FORWARD';
+          next.activityState = 'MOVING';
+          next.statusMessage = 'Forward path clear — walking';
+        }
+      } else if (patch.enabled === false && prev.enabled) {
+        next.fsmState = 'IDLE';
+        next.activityState = 'IDLE';
+        next.selectedTurnDirection = 'NONE';
+        next.committedTurn = null;
+        next.targetYawDeg = null;
+        next.initialBypassHeadingDeg = null;
+        next.bypassObstacleId = null;
+        next.lastCommandedPose = null;
+        next.statusMessage = 'Autonomous avoidance standby (IDLE)';
+      }
+      return next;
+    });
+  }, []);
+
+  // Apply Stand or Sit pose preset (clamped within channel bounds & solid obstacle bounds)
+  const handleApplyPosePreset = useCallback(
+    (preset: PosePreset) => {
+      handleStopSimulation();
+      setPosePreset(preset);
+      setChannels((prev) => {
+        const computed = getPosePresetTargets(preset, prev);
+        setBodyPose((bp) => {
+          const candPose: BodyPose = { ...bp, ...computed.bodyPose };
+          const res = resolveSolidBodyMovement(
+            bp,
+            candPose,
+            prev,
+            labObjects,
+            visualKinematicGain
+          );
+          return res.resolvedPose;
+        });
+        return prev.map((ch, idx) => ({
+          ...ch,
+          targetAngle: computed.targets[idx],
+        }));
+      });
+      setManualPoseToken((t) => t + 1);
+    },
+    [handleStopSimulation, labObjects, visualKinematicGain]
+  );
+
+  // Update individual servo channel target while preventing leg penetration into solid obstacles
+  const handleChangeChannelTarget = useCallback(
+    (channelIdx: number, requestedDeg: number) => {
+      setPosePreset('custom');
+      setChannels((prev) => {
+        const candidate = prev.map((ch) =>
+          ch.channel === channelIdx
+            ? {
+                ...ch,
+                targetAngle: clampChannelAngle(ch, requestedDeg),
+                currentSimulatedAngle: clampChannelAngle(ch, requestedDeg),
+              }
+            : ch
+        );
+        const wasCol = checkRobotPoseCollision(
+          bodyPose,
+          prev,
+          labObjects,
+          visualKinematicGain,
+          0.008
+        ).colliding;
+        const nowCol = checkRobotPoseCollision(
+          bodyPose,
+          candidate,
+          labObjects,
+          visualKinematicGain,
+          0.008
+        ).colliding;
+        if (!wasCol && nowCol) return prev;
+        return prev.map((ch) =>
+          ch.channel === channelIdx
+            ? { ...ch, targetAngle: clampChannelAngle(ch, requestedDeg) }
+            : ch
+        );
+      });
+    },
+    [bodyPose, labObjects, visualKinematicGain]
+  );
+
+  const handleResetChannel = useCallback((channelIdx: number) => {
+    setChannels((prev) =>
+      prev.map((ch) =>
+        ch.channel === channelIdx ? { ...ch, targetAngle: clampChannelAngle(ch, 95) } : ch
+      )
+    );
+  }, []);
+
+  // Explicitly widen/restore virtual simulation bounds for non-CH7 channels ONLY
+  const handleToggleExtendedSimBounds = useCallback((unlocked: boolean) => {
+    setExtendedSimBoundsUnlocked(unlocked);
+    setChannels((prev) =>
+      prev.map((ch) => {
+        if (ch.channel === 7 || ch.safetyLocked) {
+          return {
+            ...ch,
+            minAngle: 90,
+            maxAngle: 100,
+            targetAngle: Math.min(100, Math.max(90, ch.targetAngle)),
+          };
+        }
+        const nextMin = unlocked ? 65 : 90;
+        const nextMax = unlocked ? 125 : 100;
+        return {
+          ...ch,
+          minAngle: nextMin,
+          maxAngle: nextMax,
+          targetAngle: Math.min(nextMax, Math.max(nextMin, ch.targetAngle)),
+        };
+      })
+    );
+  }, []);
+
+  const handleUpdateChannelsFromSim = useCallback(
+    (targets: number[], simulatedCurrent?: number[]) => {
+      setChannels((prev) =>
+        prev.map((ch, idx) => ({
+          ...ch,
+          targetAngle: clampChannelAngle(ch, targets[idx] ?? ch.targetAngle),
+          currentSimulatedAngle:
+            simulatedCurrent?.[idx] !== undefined
+              ? simulatedCurrent[idx]
+              : ch.currentSimulatedAngle,
+        }))
+      );
+    },
+    []
+  );
+
+  // Coordinated 3-Joint movement for a single leg (with solid obstacle check)
+  const handleCoordinatedLegChange = useCallback(
+    (leg: LegId, lift: number, reach: number, spread: number) => {
+      setPosePreset('custom');
+      setChannels((prev) => {
+        const [abdTarget, hipTarget, kneeTarget] = computeCoordinatedLegTargets(
+          leg,
+          prev,
+          lift,
+          reach,
+          spread
+        );
+        const [abdIdx, hipIdx, kneeIdx] = LEG_CHANNELS_MAP[leg];
+        const candidate = prev.map((ch) => {
+          if (ch.channel === abdIdx)
+            return { ...ch, targetAngle: abdTarget, currentSimulatedAngle: abdTarget };
+          if (ch.channel === hipIdx)
+            return { ...ch, targetAngle: hipTarget, currentSimulatedAngle: hipTarget };
+          if (ch.channel === kneeIdx)
+            return { ...ch, targetAngle: kneeTarget, currentSimulatedAngle: kneeTarget };
+          return ch;
+        });
+
+        const wasCol = checkRobotPoseCollision(
+          bodyPose,
+          prev,
+          labObjects,
+          visualKinematicGain,
+          0.008
+        ).colliding;
+        const nowCol = checkRobotPoseCollision(
+          bodyPose,
+          candidate,
+          labObjects,
+          visualKinematicGain,
+          0.008
+        ).colliding;
+        if (!wasCol && nowCol) return prev;
+
+        setLegTest((lt) => ({
+          ...lt,
+          liftFactor: { ...lt.liftFactor, [leg]: lift },
+          reachFactor: { ...lt.reachFactor, [leg]: reach },
+          spreadFactor: { ...lt.spreadFactor, [leg]: spread },
+        }));
+
+        return prev.map((ch) => {
+          if (ch.channel === abdIdx) return { ...ch, targetAngle: abdTarget };
+          if (ch.channel === hipIdx) return { ...ch, targetAngle: hipTarget };
+          if (ch.channel === kneeIdx) return { ...ch, targetAngle: kneeTarget };
+          return ch;
+        });
+      });
+    },
+    [bodyPose, labObjects, visualKinematicGain]
+  );
+
+  const handleUpdateLegTest = useCallback((leg: LegId | null, running: boolean) => {
+    if (running) {
+      setGait((prev) => ({ ...prev, isRunning: false }));
+      setNavigation((prev) => ({ ...prev, enabled: false, fsmState: 'IDLE' }));
+    }
+    setLegTest((prev) => ({ ...prev, activeLeg: leg, running }));
+  }, []);
+
+  const handleUpdateGait = useCallback((patch: Partial<GaitConfig>) => {
+    setGait((prev) => {
+      const next = { ...prev, ...patch };
+      if (!next.gaitEnabled) next.isRunning = false;
+      if (next.isRunning) {
+        setLegTest((lt) => ({ ...lt, running: false, activeLeg: null }));
+        setNavigation((nav) => ({ ...nav, enabled: false, fsmState: 'IDLE' }));
+      }
+      return next;
+    });
+  }, []);
+
+  // Spawn new movable lab object outside robot collision footprint
+  const handleSpawnLabObject = useCallback(
+    (type: LabSceneObject['type']) => {
+      const n = spawnCounterRef.current++;
+      const angle = (n * 1.15) % (Math.PI * 2);
+      const radius = 1.45 + (n % 3) * 0.35;
+      const px = Math.round((bodyPose.x + Math.sin(angle) * radius) * 100) / 100;
+      const pz = Math.round((bodyPose.z + Math.cos(angle) * radius) * 100) / 100;
+
+      const meta: Record<LabSceneObject['type'], { label: string; color: string }> = {
+        wall: { label: `Barrier Wall #${n}`, color: '#475569' },
+        human: { label: `Person #${n}`, color: '#2563eb' },
+        box: { label: `Calibration Box #${n}`, color: '#d97706' },
+        cylinder: { label: `Pillar Obstacle #${n}`, color: '#0d9488' },
+        ramp: { label: `Incline Ramp #${n}`, color: '#475569' },
+        'rough-terrain': { label: `Rough Terrain #${n}`, color: '#57534e' },
+      };
+
+      const newObj: LabSceneObject = {
+        id: `${type}-${n}`,
+        type,
+        label: meta[type].label,
+        position: [
+          Math.max(-4.8, Math.min(4.8, px)),
+          0,
+          Math.max(-4.8, Math.min(4.8, pz)),
+        ],
+        rotation: [0, Math.round((angle * 180) / Math.PI), 0],
+        scale: [1, 1, 1],
+        color: meta[type].color,
+      };
+
+      setLabObjects((prev) => [...prev, newObj]);
+      setSelectedTarget({ kind: 'scene-object', objectId: newObj.id });
+    },
+    [bodyPose.x, bodyPose.z]
+  );
+
+  // Prevent solid obstacles from being pushed directly through KUKUR's body/legs via sliders
+  const handleUpdateLabObject = useCallback(
+    (id: string, patch: Partial<LabSceneObject>) => {
+      setLabObjects((prev) => {
+        const targetObj = prev.find((o) => o.id === id);
+        if (!targetObj) return prev;
+        const updatedObj: LabSceneObject = { ...targetObj, ...patch };
+        const wasCol = checkRobotPoseCollision(
+          bodyPose,
+          channels,
+          [targetObj],
+          visualKinematicGain,
+          0.01
+        ).colliding;
+        const nowCol = checkRobotPoseCollision(
+          bodyPose,
+          channels,
+          [updatedObj],
+          visualKinematicGain,
+          0.01
+        ).colliding;
+        if (!wasCol && nowCol) {
+          return prev;
+        }
+        return prev.map((obj) => (obj.id === id ? updatedObj : obj));
+      });
+    },
+    [bodyPose, channels, visualKinematicGain]
+  );
+
+  const handleDeleteLabObject = useCallback((id: string) => {
+    setLabObjects((prev) => prev.filter((obj) => obj.id !== id));
+    setSelectedTarget((prev) =>
+      prev?.kind === 'scene-object' && prev.objectId === id ? null : prev
+    );
+  }, []);
+
+  // Execute Simulated / Voice Commands (Virtual Robot Only)
+  const handleExecuteVoiceCommand = useCallback(
+    (phrase: string, source: 'simulated-text' | 'browser-voice') => {
+      const norm = phrase.toLowerCase().trim();
+      let actionTaken = 'Unrecognized command';
+
+      if (norm.includes('stop') || norm.includes('halt')) {
+        handleStopSimulation();
+        actionTaken = 'Stopped virtual simulation';
+      } else if (norm.includes('reset')) {
+        handleResetScenario();
+        actionTaken = 'Reset robot & scene to initial positions';
+      } else if (norm.includes('avoid') || norm.includes('navigate')) {
+        handleUpdateNavigation({ enabled: true });
+        actionTaken = 'Enabled autonomous obstacle avoidance (Sim)';
+      } else if (norm.includes('stand')) {
+        handleApplyPosePreset('stand');
+        actionTaken = 'Applied STAND pose (Sim)';
+      } else if (norm.includes('sit')) {
+        handleApplyPosePreset('sit');
+        actionTaken = 'Applied SIT pose (Sim)';
+      } else if (norm.includes('trot') || norm.includes('walk')) {
+        actionTaken = gait.gaitEnabled
+          ? 'Started virtual gait'
+          : 'Blocked: Enable Gait Execution first';
+        if (gait.gaitEnabled) {
+          setGait((prev) => ({
+            ...prev,
+            selectedGait: norm.includes('walk') ? 'walk' : 'trot',
+            isRunning: true,
+          }));
+        }
+      }
+
+      setMicModule((prev) => ({
+        ...prev,
+        lastCommand: phrase,
+        commandLog: [
+          {
+            id: `${Date.now()}-${Math.random()}`,
+            timestamp: new Date().toLocaleTimeString(),
+            source,
+            phrase,
+            actionTaken,
+          },
+          ...prev.commandLog,
+        ].slice(0, 12),
+      }));
+    },
+    [
+      gait.gaitEnabled,
+      handleApplyPosePreset,
+      handleResetScenario,
+      handleStopSimulation,
+      handleUpdateNavigation,
+    ]
+  );
+
+  const handleUpdateLiveTelemetry = useCallback(
+    (
+      patch: Partial<SensorTelemetry>,
+      nextDetections: SimulatedDetection[],
+      nextCollidingIds: string[]
+    ) => {
+      setTelemetry((prev) => ({ ...prev, ...patch }));
+      setDetections(nextDetections);
+      setCollidingIds(nextCollidingIds);
+    },
+    []
+  );
+
+  const isSimRunning =
+    navigation.enabled ||
+    (gait.gaitEnabled && gait.isRunning) ||
+    (legTest.running && legTest.activeLeg !== null);
 
   return (
-    <div className="relative w-screen h-screen overflow-hidden bg-neutral-950 font-sans select-none">
-      {/* Top Left Engineering Spec Badge */}
-      <div className="absolute top-3 left-3 z-20 pointer-events-auto">
-        <div className="flex items-center gap-2.5 bg-neutral-900/90 border border-neutral-800/90 px-3.5 py-2 rounded-xl shadow-xl backdrop-blur-none">
-          <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center font-bold text-amber-400 font-mono text-sm">
-            KU
-          </div>
-          <div>
-            <div className="flex items-center gap-1.5">
-              <span className="font-extrabold text-xs tracking-wider text-neutral-100 uppercase">
-                Project: KUKUR
-              </span>
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 font-bold">
-                12-DOF Quadruped
-              </span>
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                SIMULATION ONLY
-              </span>
-            </div>
-            <div className="text-[11px] text-neutral-400 font-mono flex items-center gap-1.5 mt-0.5">
-              <span className="text-amber-300 font-semibold">{selectedPartName}</span>
-              <span className="text-neutral-600">•</span>
-              <span className="text-neutral-400">
-                State:{' '}
-                <strong
-                  className={
-                    isEmergencyStopped
-                      ? 'text-rose-400'
-                      : isSimRunning
-                      ? 'text-emerald-400'
-                      : 'text-neutral-300'
-                  }
-                >
-                  {isEmergencyStopped ? 'E-STOPPED' : isSimRunning ? 'WALKING' : 'STATIONARY'}
-                </strong>
-              </span>
-            </div>
-          </div>
-        </div>
-      </div>
+    <div className="h-screen w-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden">
+      {/* Strict 3-Zone Top Navigation Bar */}
+      <header className="flex items-center justify-between gap-8 px-6 py-3 bg-slate-950 border-b border-slate-800 shrink-0 z-30">
+        {/* Zone 1: Single text element wordmark */}
+        <a
+          href="#top"
+          onClick={(e) => e.preventDefault()}
+          className="text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0"
+        >
+          KUKUR
+        </a>
 
-      {/* Top Right Live Telemetry Quick Bar */}
-      <div className="absolute top-3 right-3 z-20 pointer-events-auto flex items-center gap-2">
-        {/* Ultrasonic distance */}
-        <div className="flex items-center gap-1.5 bg-neutral-900/90 border border-neutral-800/90 px-2.5 py-1.5 rounded-xl text-xs font-mono shadow-xl backdrop-blur-none">
-          <Radio className="w-3.5 h-3.5 text-sky-400" />
-          <span className="text-neutral-400">US:</span>
-          <span
-            className={`font-semibold ${
-              sensors.ultrasonicDistanceCm < 30
-                ? 'text-rose-400'
-                : sensors.ultrasonicDistanceCm < 80
-                ? 'text-amber-400'
-                : 'text-emerald-400'
-            }`}
+        {/* Zone 2: 5 concise single-line navigation links */}
+        <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
+          {(
+            [
+              { id: 'control', label: 'Control' },
+              { id: 'joints', label: 'Joints' },
+              { id: 'modules', label: 'Modules' },
+              { id: 'scene', label: 'Lab Scene' },
+              { id: 'telemetry', label: 'Telemetry' },
+            ] as Array<{ id: DashboardTab; label: string }>
+          ).map((nav) => (
+            <button
+              key={nav.id}
+              type="button"
+              onClick={() => {
+                setActiveTab(nav.id);
+                setSidebarOpen(true);
+              }}
+              className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 cursor-pointer ${
+                activeTab === nav.id && sidebarOpen
+                  ? 'text-white border-blue-500'
+                  : 'border-transparent hover:text-slate-100'
+              }`}
+            >
+              {nav.label}
+            </button>
+          ))}
+        </nav>
+
+        {/* Zone 3: 1 primary safety action */}
+        <div className="flex items-center gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={handleStopSimulation}
+            className="px-4 py-1.5 text-xs font-semibold text-white bg-red-600 hover:bg-red-500 rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
           >
-            {sensors.ultrasonicDistanceCm.toFixed(1)}cm
-          </span>
+            <OctagonX className="w-3.5 h-3.5" />
+            Stop Simulation
+          </button>
         </div>
+      </header>
 
-        {/* IMU tilt */}
-        <div className="flex items-center gap-1.5 bg-neutral-900/90 border border-neutral-800/90 px-2.5 py-1.5 rounded-xl text-xs font-mono shadow-xl backdrop-blur-none">
-          <Compass className="w-3.5 h-3.5 text-amber-400" />
-          <span className="text-neutral-400">IMU:</span>
-          <span className="text-neutral-200">
-            {sensors.imu.roll > 0 ? `+${sensors.imu.roll}` : sensors.imu.roll}° /{' '}
-            {sensors.imu.pitch > 0 ? `+${sensors.imu.pitch}` : sensors.imu.pitch}°
-          </span>
-        </div>
+      {/* Main 3D Workspace + Collapsible Robotics Engineering Dashboard */}
+      <div className="flex-1 flex min-h-0 relative">
+        <Viewport3D
+          channels={channels}
+          onUpdateChannelsFromSim={handleUpdateChannelsFromSim}
+          bodyPose={bodyPose}
+          onUpdateBodyPose={handleUpdateBodyPose}
+          onUpdateBodyPoseFromSim={handleUpdateBodyPoseFromSim}
+          manualPoseToken={manualPoseToken}
+          posePreset={posePreset}
+          gait={gait}
+          onStopGaitBeforeCollision={handleStopGaitBeforeCollision}
+          legTest={legTest}
+          navigation={navigation}
+          onUpdateNavigation={handleUpdateNavigation}
+          scenarioResetToken={scenarioResetToken}
+          cameraModule={cameraModule}
+          onUpdateCameraModule={(patch) => setCameraModule((prev) => ({ ...prev, ...patch }))}
+          lcdModule={lcdModule}
+          onUpdateLcdModule={(patch) => setLcdModule((prev) => ({ ...prev, ...patch }))}
+          micModule={micModule}
+          onUpdateMicModule={(patch) => setMicModule((prev) => ({ ...prev, ...patch }))}
+          labObjects={labObjects}
+          onUpdateLabObject={handleUpdateLabObject}
+          onSpawnLabObject={handleSpawnLabObject}
+          selectedTarget={selectedTarget}
+          onSelectTarget={setSelectedTarget}
+          attachmentMode={attachmentMode}
+          onToggleAttachmentMode={() => setAttachmentMode((v) => !v)}
+          cameraViewMode={cameraViewMode}
+          onChangeCameraViewMode={setCameraViewMode}
+          lightingPreset={lightingPreset}
+          lightIntensity={lightIntensity}
+          shadowsEnabled={shadowsEnabled}
+          visualKinematicGain={visualKinematicGain}
+          telemetry={telemetry}
+          onUpdateLiveTelemetry={handleUpdateLiveTelemetry}
+          detections={detections}
+          robotFeedCanvasRef={robotFeedCanvasRef}
+        />
 
-        {/* Detections Count */}
-        <div className="flex items-center gap-1.5 bg-neutral-900/90 border border-neutral-800/90 px-2.5 py-1.5 rounded-xl text-xs font-mono shadow-xl backdrop-blur-none">
-          <Scan className="w-3.5 h-3.5 text-purple-400" />
-          <span className="text-neutral-400">Vision:</span>
-          <span className="text-purple-300 font-bold">{detections.length} objects</span>
-        </div>
+        {!sidebarOpen && (
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+            className="absolute top-4 right-4 z-30 px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs font-medium text-slate-200 hover:text-white flex items-center gap-1.5 shadow-lg cursor-pointer"
+          >
+            <PanelRightOpen className="w-4 h-4 text-sky-400" />
+            Open Controls
+          </button>
+        )}
 
-        {/* LiPo Voltage */}
-        <div className="flex items-center gap-1.5 bg-neutral-900/90 border border-neutral-800/90 px-2.5 py-1.5 rounded-xl text-xs font-mono shadow-xl backdrop-blur-none">
-          <BatteryCharging className="w-3.5 h-3.5 text-emerald-400" />
-          <span className="text-emerald-300 font-semibold">{sensors.batteryVoltage.toFixed(2)}V</span>
-        </div>
+        <aside
+          className={`${
+            sidebarOpen ? 'w-full sm:w-[420px] border-l border-slate-800' : 'w-0 overflow-hidden'
+          } bg-slate-950 flex flex-col shrink-0 transition-opacity duration-150 z-20`}
+        >
+          <div className="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+            <div className="flex items-center gap-1.5 text-[11px] font-mono text-slate-400 truncate">
+              <span className="text-emerald-400 font-semibold">SIMULATION</span>
+              <span aria-hidden="true">·</span>
+              <span>NO HARDWARE</span>
+              <span aria-hidden="true">·</span>
+              <span>CH7 90–100°</span>
+            </div>
+            <button
+              type="button"
+              title="Collapse Dashboard"
+              onClick={() => setSidebarOpen(false)}
+              className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer shrink-0"
+            >
+              <PanelRightClose className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="px-4 pt-3 pb-2 shrink-0">
+            <div className="grid grid-cols-5 gap-1 p-1 bg-slate-900 rounded-lg border border-slate-800">
+              {(
+                [
+                  { id: 'control', label: 'Control' },
+                  { id: 'joints', label: 'Joints' },
+                  { id: 'modules', label: 'Modules' },
+                  { id: 'scene', label: 'Lab' },
+                  { id: 'telemetry', label: 'Sensors' },
+                ] as Array<{ id: DashboardTab; label: string }>
+              ).map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  onClick={() => setActiveTab(t.id)}
+                  className={`py-1.5 px-1 rounded text-xs font-medium transition-colors whitespace-nowrap truncate cursor-pointer ${
+                    activeTab === t.id
+                      ? 'bg-slate-800 text-white shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4">
+            {activeTab === 'control' && (
+              <RobotControlPanel
+                channels={channels}
+                bodyPose={bodyPose}
+                onUpdateBodyPose={handleUpdateBodyPose}
+                posePreset={posePreset}
+                onApplyPosePreset={handleApplyPosePreset}
+                onStopSimulation={handleStopSimulation}
+                onResetAll={handleResetAll}
+                navigation={navigation}
+                onUpdateNavigation={handleUpdateNavigation}
+                activeScenario={activeScenario}
+                onSelectScenario={applyScenarioLayout}
+                onResetScenario={handleResetScenario}
+                gait={gait}
+                onUpdateGait={handleUpdateGait}
+                legTest={legTest}
+                onUpdateLegTest={handleUpdateLegTest}
+                onCoordinatedLegChange={handleCoordinatedLegChange}
+              />
+            )}
+
+            {activeTab === 'joints' && (
+              <JointControlPanel
+                channels={channels}
+                selectedTarget={selectedTarget}
+                onSelectChannel={(ch) => setSelectedTarget({ kind: 'joint', channel: ch })}
+                onChangeChannelTarget={handleChangeChannelTarget}
+                onResetChannel={handleResetChannel}
+                onResetAllChannels={handleResetAll}
+                extendedSimBoundsUnlocked={extendedSimBoundsUnlocked}
+                onToggleExtendedSimBounds={handleToggleExtendedSimBounds}
+                visualKinematicGain={visualKinematicGain}
+                onChangeVisualKinematicGain={setVisualKinematicGain}
+              />
+            )}
+
+            <div className={activeTab === 'modules' ? 'block' : 'hidden'}>
+              <ModulesVisionPanel
+                cameraModule={cameraModule}
+                onUpdateCameraModule={(patch) =>
+                  setCameraModule((prev) => ({ ...prev, ...patch }))
+                }
+                cameraViewMode={cameraViewMode}
+                onChangeCameraViewMode={setCameraViewMode}
+                detections={detections}
+                robotFeedCanvasRef={robotFeedCanvasRef}
+                lcdModule={lcdModule}
+                onUpdateLcdModule={(patch) =>
+                  setLcdModule((prev) => ({ ...prev, ...patch }))
+                }
+                micModule={micModule}
+                onUpdateMicModule={(patch) =>
+                  setMicModule((prev) => ({ ...prev, ...patch }))
+                }
+                onExecuteVoiceCommand={handleExecuteVoiceCommand}
+                onSelectTarget={setSelectedTarget}
+                posePreset={posePreset}
+                isSimRunning={isSimRunning}
+                channels={channels}
+                telemetry={telemetry}
+                navigation={navigation}
+              />
+            </div>
+
+            {activeTab === 'scene' && (
+              <SceneLabPanel
+                labObjects={labObjects}
+                collidingIds={collidingIds}
+                detectedObstacleIds={navigation.detectedObstacleIds}
+                activeScenario={activeScenario}
+                onSelectScenario={applyScenarioLayout}
+                onResetScenario={handleResetScenario}
+                selectedTarget={selectedTarget}
+                onSelectTarget={setSelectedTarget}
+                onSpawnLabObject={handleSpawnLabObject}
+                onUpdateLabObject={handleUpdateLabObject}
+                onDeleteLabObject={handleDeleteLabObject}
+                attachmentMode={attachmentMode}
+                onToggleAttachmentMode={() => setAttachmentMode((v) => !v)}
+                lightingPreset={lightingPreset}
+                onChangeLightingPreset={setLightingPreset}
+                lightIntensity={lightIntensity}
+                onChangeLightIntensity={setLightIntensity}
+                shadowsEnabled={shadowsEnabled}
+                onToggleShadows={setShadowsEnabled}
+              />
+            )}
+
+            {activeTab === 'telemetry' && (
+              <TelemetryPanel
+                telemetry={telemetry}
+                onUpdateTelemetryConfig={(patch) =>
+                  setTelemetry((prev) => ({ ...prev, ...patch }))
+                }
+                navigation={navigation}
+                onUpdateNavigation={handleUpdateNavigation}
+                channels={channels}
+                cameraModule={cameraModule}
+              />
+            )}
+          </div>
+        </aside>
       </div>
-
-      {/* 3D Viewport - 100% Unobstructed Center Viewport */}
-      <Viewport3D
-        gait={gait}
-        envType={envType}
-        bodyPose={bodyPose}
-        strideLength={strideLength}
-        stepHeight={stepHeight}
-        turnRate={turnRate}
-        speedMultiplier={speedMultiplier}
-        cameraMode={cameraMode}
-        onSensorsUpdate={handleSensorsUpdate}
-        onDetectionsUpdate={setDetections}
-        onSelectJointOrPart={handleSelectJointOrPart}
-        selectedChannel={selectedChannel}
-        isSimRunning={isSimRunning}
-        isEmergencyStopped={isEmergencyStopped}
-        lcdState={lcdState}
-        isFovVisible={isFovVisible}
-        sceneItems={sceneItems}
-      />
-
-      {/* Sleek Collapsible Bottom Engineering Dock with all 9 Tabs */}
-      <BottomControlDock
-        gait={gait}
-        setGait={(newGait) => {
-          setGait(newGait);
-          if (newGait === 'trot' || newGait === 'walk' || newGait === 'pace' || newGait === 'gallop') {
-            setIsSimRunning(true);
-            setRobotState('WALKING');
-          } else if (newGait === 'sit') {
-            setIsSimRunning(false);
-            setRobotState('SITTING');
-          } else if (newGait === 'stand') {
-            setIsSimRunning(false);
-            setRobotState('STANDING');
-          }
-        }}
-        envType={envType}
-        setEnvType={setEnvType}
-        bodyPose={bodyPose}
-        setBodyPose={setBodyPose}
-        strideLength={strideLength}
-        setStrideLength={setStrideLength}
-        turnRate={turnRate}
-        setTurnRate={setTurnRate}
-        speedMultiplier={speedMultiplier}
-        setSpeedMultiplier={setSpeedMultiplier}
-        cameraMode={cameraMode}
-        setCameraMode={setCameraMode}
-        sensors={sensors}
-        joints={joints}
-        setJoints={setJoints}
-        selectedChannel={selectedChannel}
-        setSelectedChannel={(ch) => {
-          setSelectedChannel(ch);
-          setSelectedPartName(`Joint CH${ch}`);
-        }}
-        isSimRunning={isSimRunning}
-        setIsSimRunning={setIsSimRunning}
-        isEmergencyStopped={isEmergencyStopped}
-        onEmergencyStop={handleEmergencyStop}
-        onResetSimulation={handleResetSimulation}
-        robotState={robotState}
-        detections={detections}
-        isFovVisible={isFovVisible}
-        onToggleFov={() => setIsFovVisible(!isFovVisible)}
-        lcdState={lcdState}
-        setLcdState={setLcdState}
-        micState={micState}
-        setMicState={setMicState}
-        onExecuteVoiceCommand={handleExecuteVoiceCommand}
-        sceneItems={sceneItems}
-        onAddItem={handleAddItem}
-        onRemoveItem={handleRemoveItem}
-        onUpdateItemPos={handleUpdateItemPos}
-        logs={logs}
-        onClearLogs={() => setLogs([])}
-        simTimeSeconds={simTimeSeconds}
-      />
     </div>
   );
 }

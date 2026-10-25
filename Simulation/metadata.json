@@ -1,6 +1,6 @@
 {
-  "name": "SpotMicroAI - 3D Quadruped Sim, RL & Pi 4 Studio",
-  "description": "Complete 3D simulation, sensor suite, reinforcement learning gym, and Raspberry Pi 4 deployment suite for the SpotMicroAI 12-DOF robot dog.",
-  "requestFramePermissions": [],
+  "name": "KUKUR — 3D Quadruped Robot Simulator",
+  "description": "Interactive 3D robotics simulator for the KUKUR quadruped prototype featuring 12-channel articulated leg kinematics, virtual camera object detection, attachable LCD and microphone modules, and simulated sensor telemetry.",
+  "requestFramePermissions": ["camera", "microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

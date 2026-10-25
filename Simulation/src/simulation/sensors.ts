@@ -1,124 +1,221 @@
-import { LegId, RobotJointAngles, SensorData, Vector3D } from '../types/robot';
+import * as THREE from 'three';
+import {
+  BodyPose,
+  LabSceneObject,
+  SensorTelemetry,
+  SimulatedDetection,
+} from '../types/simulator';
 
-export interface Obstacle3D {
-  type: 'box' | 'cylinder' | 'ramp';
-  position: Vector3D; // mm
-  size: Vector3D;     // mm [width, height, depth] or [radius, height, radius]
+const _vCenter = new THREE.Vector3();
+const _vCorner = new THREE.Vector3();
+const _vCamPos = new THREE.Vector3();
+const _vCamDir = new THREE.Vector3();
+const _vToObj = new THREE.Vector3();
+const _raycaster = new THREE.Raycaster();
+const _ultraOrigin = new THREE.Vector3();
+const _ultraDir = new THREE.Vector3();
+const _chassisQuat = new THREE.Quaternion();
+const _chassisEuler = new THREE.Euler();
+
+function getObjectLocalBounds(type: LabSceneObject['type']): {
+  minY: number;
+  maxY: number;
+  halfX: number;
+  halfZ: number;
+  classLabel: string;
+} {
+  switch (type) {
+    case 'human':
+      return { minY: 0, maxY: 1.72, halfX: 0.24, halfZ: 0.18, classLabel: 'person' };
+    case 'box':
+      return { minY: 0, maxY: 0.36, halfX: 0.2, halfZ: 0.2, classLabel: 'box_obstacle' };
+    case 'cylinder':
+      return { minY: 0, maxY: 0.56, halfX: 0.2, halfZ: 0.2, classLabel: 'cylinder' };
+    case 'wall':
+      return { minY: 0, maxY: 0.65, halfX: 0.8, halfZ: 0.08, classLabel: 'barrier_wall' };
+    case 'ramp':
+      return { minY: 0, maxY: 0.24, halfX: 0.37, halfZ: 0.45, classLabel: 'incline_ramp' };
+    case 'rough-terrain':
+      return { minY: 0, maxY: 0.08, halfX: 0.48, halfZ: 0.48, classLabel: 'rough_terrain' };
+  }
 }
 
 /**
- * Simulates real-time sensor reads (HC-SR04 Ultrasonic, MPU-6050 IMU, Foot Contact switches, Battery/Current)
+ * Project 3D virtual lab objects through the robot's virtual PerspectiveCamera
+ * to produce accurate simulated 2D bounding boxes, class labels, confidence scores,
+ * and simulated RGB-D distances.
  */
-export function simulateSensors(
-  robotPos: Vector3D,
-  robotRot: { roll: number; pitch: number; yaw: number }, // in degrees
-  jointAngles: RobotJointAngles,
-  footContacts: Record<LegId, boolean>,
-  obstacles: Obstacle3D[],
-  deltaTime: number,
-  previousRot?: { roll: number; pitch: number; yaw: number }
-): SensorData {
-  // 1. HC-SR04 Ultrasonic Raycast Simulation
-  // Sensor is mounted at front center of SpotMicro (+150mm forward, +20mm above center)
-  const degToRad = Math.PI / 180;
-  const yawRad = robotRot.yaw * degToRad;
-  const pitchRad = robotRot.pitch * degToRad;
+export function computeVirtualDetections(
+  robotCamera: THREE.PerspectiveCamera,
+  objects: LabSceneObject[]
+): SimulatedDetection[] {
+  robotCamera.updateMatrixWorld(true);
+  robotCamera.getWorldPosition(_vCamPos);
+  robotCamera.getWorldDirection(_vCamDir);
 
-  // Sensor forward direction vector
-  const rayDirX = Math.sin(yawRad) * Math.cos(pitchRad);
-  const rayDirY = -Math.sin(pitchRad);
-  const rayDirZ = Math.cos(yawRad) * Math.cos(pitchRad);
+  const detections: SimulatedDetection[] = [];
 
-  const sensorOriginX = robotPos.x + Math.sin(yawRad) * 150;
-  const sensorOriginY = robotPos.y + 20;
-  const sensorOriginZ = robotPos.z + Math.cos(yawRad) * 150;
+  for (const obj of objects) {
+    const bounds = getObjectLocalBounds(obj.type);
+    const sx = obj.scale[0];
+    const sy = obj.scale[1];
+    const sz = obj.scale[2];
 
-  let minDistanceMm = 4000; // max sensor range is 4 meters (400 cm)
+    const centerY = obj.position[1] + (bounds.minY + bounds.maxY) * 0.5 * sy;
+    _vCenter.set(obj.position[0], centerY, obj.position[2]);
 
-  // Raycast against ground if tilted downwards
-  if (rayDirY < -0.05 && sensorOriginY > 0) {
-    const groundDist = -sensorOriginY / rayDirY;
-    if (groundDist > 0 && groundDist < minDistanceMm) {
-      minDistanceMm = groundDist;
-    }
-  }
+    _vToObj.subVectors(_vCenter, _vCamPos);
+    const centerDistance = _vToObj.length();
+    if (centerDistance < 0.05 || centerDistance > 9.5) continue;
 
-  // Raycast against 3D obstacles
-  for (const obs of obstacles) {
-    // Simple bounding sphere / box intersection
-    const dx = obs.position.x - sensorOriginX;
-    const dy = obs.position.y - sensorOriginY;
-    const dz = obs.position.z - sensorOriginZ;
+    // Project 8 corners + 4 midpoints of object's oriented bounding box into camera NDC [-1, 1]
+    // (including midpoints ensures wide walls spanning across the camera view are accurately detected!)
+    const rotRad = (obj.rotation[1] * Math.PI) / 180;
+    const cosY = Math.cos(rotRad);
+    const sinY = Math.sin(rotRad);
 
-    // Projection along ray
-    const projection = dx * rayDirX + dy * rayDirY + dz * rayDirZ;
-    if (projection > 0 && projection < minDistanceMm) {
-      const perpDistSq = (dx * dx + dy * dy + dz * dz) - projection * projection;
-      const radius = Math.max(obs.size.x, obs.size.z) / 2;
-      if (perpDistSq < radius * radius) {
-        minDistanceMm = Math.min(minDistanceMm, Math.max(20, projection - radius));
+    let minNdcX = Infinity;
+    let maxNdcX = -Infinity;
+    let minNdcY = Infinity;
+    let maxNdcY = -Infinity;
+    let minPointDist = Infinity;
+    let validSamples = 0;
+
+    const hx = bounds.halfX * sx;
+    const hz = bounds.halfZ * sz;
+    const y0 = obj.position[1] + bounds.minY * sy;
+    const y1 = obj.position[1] + bounds.maxY * sy;
+
+    const xs = [-hx, 0, hx];
+    const ys = [y0, (y0 + y1) * 0.5, y1];
+    const zs = [-hz, hz];
+
+    for (let xi = 0; xi < xs.length; xi++) {
+      for (let yi = 0; yi < ys.length; yi++) {
+        for (let zi = 0; zi < zs.length; zi++) {
+          const lx = xs[xi];
+          const lz = zs[zi];
+          const wx = obj.position[0] + lx * cosY + lz * sinY;
+          const wz = obj.position[2] - lx * sinY + lz * cosY;
+
+          _vCorner.set(wx, ys[yi], wz);
+          _vToObj.subVectors(_vCorner, _vCamPos);
+          const ptDist = _vToObj.length();
+          if (_vToObj.dot(_vCamDir) <= 0.05) continue;
+
+          if (ptDist < minPointDist) minPointDist = ptDist;
+          _vCorner.project(robotCamera);
+          validSamples++;
+          if (_vCorner.x < minNdcX) minNdcX = _vCorner.x;
+          if (_vCorner.x > maxNdcX) maxNdcX = _vCorner.x;
+          if (_vCorner.y < minNdcY) minNdcY = _vCorner.y;
+          if (_vCorner.y > maxNdcY) maxNdcY = _vCorner.y;
+        }
       }
     }
+
+    if (validSamples < 2) continue;
+    if (maxNdcX < -0.98 || minNdcX > 0.98 || maxNdcY < -0.98 || minNdcY > 0.98) {
+      continue;
+    }
+
+    const xLeft = THREE.MathUtils.clamp((minNdcX + 1) * 0.5, 0.01, 0.98);
+    const xRight = THREE.MathUtils.clamp((maxNdcX + 1) * 0.5, 0.02, 0.99);
+    const yTop = THREE.MathUtils.clamp((1 - maxNdcY) * 0.5, 0.01, 0.98);
+    const yBottom = THREE.MathUtils.clamp((1 - minNdcY) * 0.5, 0.02, 0.99);
+
+    const width = xRight - xLeft;
+    const height = yBottom - yTop;
+    if (width < 0.03 || height < 0.03) continue;
+
+    const effectiveDist = Math.min(centerDistance, minPointDist);
+    const centerBias =
+      1 - Math.min(1, Math.hypot((minNdcX + maxNdcX) * 0.5, (minNdcY + maxNdcY) * 0.5));
+    const distFactor = THREE.MathUtils.clamp(1 - effectiveDist / 8.5, 0.35, 0.99);
+    const baseConf = obj.type === 'human' ? 0.94 : 0.89;
+    const confidence = Math.min(
+      0.99,
+      Math.max(0.52, baseConf * 0.72 + distFactor * 0.18 + centerBias * 0.1)
+    );
+
+    detections.push({
+      id: `det-${obj.id}`,
+      objectId: obj.id,
+      label: bounds.classLabel,
+      confidence: Math.round(confidence * 100) / 100,
+      distanceMeters: Math.round(effectiveDist * 100) / 100,
+      bbox: {
+        x: xLeft,
+        y: yTop,
+        width,
+        height,
+      },
+      source: 'SIMULATED_3D',
+    });
   }
 
-  // Convert to cm with subtle sensor noise (±0.5 cm)
-  const noise = (Math.random() - 0.5) * 0.8;
-  const ultrasonicDistanceCm = Math.round(
-    Math.min(400, Math.max(2, minDistanceMm / 10 + noise)) * 10
-  ) / 10;
+  detections.sort((a, b) => a.distanceMeters - b.distanceMeters);
+  return detections;
+}
 
-  // 2. MPU-6050 6-DOF IMU Simulation
-  // Gyroscope angular rate in rad/s
-  const prev = previousRot || robotRot;
-  const dt = Math.max(0.001, deltaTime);
-  const gyro: Vector3D = {
-    x: ((robotRot.pitch - prev.pitch) * degToRad) / dt,
-    y: ((robotRot.yaw - prev.yaw) * degToRad) / dt,
-    z: ((robotRot.roll - prev.roll) * degToRad) / dt,
-  };
+/**
+ * Compute simulated HC-SR04 ultrasonic distance (cm) using Three.js Raycaster
+ * from the front ultrasonic transducer on the chassis.
+ */
+export function computeSimulatedUltrasonicCm(
+  chassisObject: THREE.Object3D,
+  obstacleMeshes: THREE.Object3D[]
+): number {
+  chassisObject.updateMatrixWorld(true);
+  _ultraOrigin.set(0, -0.015, 0.27);
+  chassisObject.localToWorld(_ultraOrigin);
 
-  // Accelerometer in m/s^2 (including gravity vector 9.81)
-  const g = 9.81;
-  const rollRad = robotRot.roll * degToRad;
-  const accel: Vector3D = {
-    x: g * Math.sin(rollRad) + (Math.random() - 0.5) * 0.1,
-    y: g * Math.cos(rollRad) * Math.cos(pitchRad) + (Math.random() - 0.5) * 0.1,
-    z: -g * Math.sin(pitchRad) + (Math.random() - 0.5) * 0.1,
-  };
+  _ultraDir.set(0, 0, 1).transformDirection(chassisObject.matrixWorld).normalize();
+  _raycaster.set(_ultraOrigin, _ultraDir);
+  _raycaster.near = 0.02;
+  _raycaster.far = 4.0;
 
-  // 3. Foot Contact Forces (Newtons)
-  // SpotMicro total mass ~2.6 kg (including Pi 4, battery, 12 servos, chassis)
-  const totalWeightN = 2.6 * 9.81; // ~25.5 N
-  const activeContacts = (footContacts.FL ? 1 : 0) + (footContacts.FR ? 1 : 0) +
-                         (footContacts.RL ? 1 : 0) + (footContacts.RR ? 1 : 0);
-  const nominalForcePerFoot = activeContacts > 0 ? totalWeightN / activeContacts : 0;
+  const hits = _raycaster.intersectObjects(obstacleMeshes, true);
+  if (hits.length > 0) {
+    return Math.round(hits[0].distance * 1000) / 10;
+  }
+  return 400.0;
+}
 
-  const footForces = {
-    FL: footContacts.FL ? nominalForcePerFoot + (Math.random() - 0.5) * 1.5 : 0,
-    FR: footContacts.FR ? nominalForcePerFoot + (Math.random() - 0.5) * 1.5 : 0,
-    RL: footContacts.RL ? nominalForcePerFoot + (Math.random() - 0.5) * 1.5 : 0,
-    RR: footContacts.RR ? nominalForcePerFoot + (Math.random() - 0.5) * 1.5 : 0,
-  };
+/**
+ * Compute simulated MPU6050 Accelerometer (g) and Gyroscope (deg/s) from chassis pose & angular rates
+ */
+export function computeSimulatedImu(
+  pose: BodyPose,
+  prevPose: BodyPose,
+  dt: number,
+  isMoving: boolean,
+  noiseAmplitude: number
+): Pick<SensorTelemetry, 'accel' | 'gyro'> {
+  const safeDt = Math.max(dt, 0.008);
+  _chassisEuler.set(
+    THREE.MathUtils.degToRad(pose.pitch),
+    THREE.MathUtils.degToRad(pose.yaw),
+    THREE.MathUtils.degToRad(pose.roll),
+    'YXZ'
+  );
+  _chassisQuat.setFromEuler(_chassisEuler).invert();
 
-  // 4. Power & Battery (2S LiPo 7.4V nominal, 8.4V max)
-  // Base current for Pi 4 (~0.8A) + PCA9685/servos (0.2A idle to 3.5A during dynamic gait)
-  const dynamicFactor = (Math.abs(gyro.x) + Math.abs(gyro.y) + Math.abs(gyro.z)) * 0.4;
-  const servoCurrentAmps = Math.round((1.1 + dynamicFactor + Math.random() * 0.2) * 100) / 100;
-  const batteryVoltage = Math.round((7.85 - servoCurrentAmps * 0.08) * 100) / 100;
+  const gBody = new THREE.Vector3(0, 1, 0).applyQuaternion(_chassisQuat);
+  const vib = isMoving ? 0.04 : 0.0;
+  const jitter = () => (Math.random() - 0.5) * 2 * (noiseAmplitude + vib);
+
+  const ax = Math.round((gBody.x + jitter()) * 1000) / 1000;
+  const ay = Math.round((gBody.y + jitter()) * 1000) / 1000;
+  const az = Math.round((gBody.z + jitter()) * 1000) / 1000;
+
+  const gx =
+    Math.round(((pose.pitch - prevPose.pitch) / safeDt + jitter() * 8) * 10) / 10;
+  const gy = Math.round(((pose.yaw - prevPose.yaw) / safeDt + jitter() * 8) * 10) / 10;
+  const gz = Math.round(((pose.roll - prevPose.roll) / safeDt + jitter() * 8) * 10) / 10;
 
   return {
-    ultrasonicDistanceCm,
-    imu: {
-      roll: Math.round(robotRot.roll * 10) / 10,
-      pitch: Math.round(robotRot.pitch * 10) / 10,
-      yaw: Math.round(robotRot.yaw * 10) / 10,
-      accel,
-      gyro,
-      tempC: Math.round((38.2 + Math.random() * 0.3) * 10) / 10,
-    },
-    footContacts,
-    footForces,
-    batteryVoltage,
-    servoCurrentAmps,
+    accel: [ax, ay, az],
+    gyro: [gx, gy, gz],
   };
 }
