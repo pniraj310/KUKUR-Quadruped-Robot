@@ -1,0 +1,6 @@
+{
+  "name": "SpotMicroAI - 3D Quadruped Sim, RL & Pi 4 Studio",
+  "description": "Complete 3D simulation, sensor suite, reinforcement learning gym, and Raspberry Pi 4 deployment suite for the SpotMicroAI 12-DOF robot dog.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
